@@ -16,6 +16,8 @@ import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+import psycopg2
+from psycopg2.extras import DictCursor
 
 
 ROOT = Path(__file__).resolve().parent
@@ -31,11 +33,72 @@ def now_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
 
-def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+def db():
+    """
+    Dynamically connects to Neon (PostgreSQL) if DATABASE_URL is available.
+    Falls back to a local SQLite file during local development if needed.
+    """
+    if DATABASE_URL:
+        conn = psycopg2.connect(DATABASE_URL, cursor_factory=DictCursor)
+        return PostgresToSQLiteAdapter(conn)
+    else:
+        conn = sqlite3.connect("/tmp/prostarm_inventory.db")
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        return conn
+
+class PostgresToSQLiteAdapter:
+    """Translates SQLite-style python calls into PostgreSQL-compatible execution."""
+    def __init__(self, pg_conn):
+        self.pg_conn = pg_conn
+        self._cursor = None
+
+    def execute(self, query, params=None):
+        query = query.replace("?", "%s")
+        self._cursor = self.pg_conn.cursor()
+        self._cursor.execute(query, params)
+        return self
+
+    def fetchone(self):
+        row = self._cursor.fetchone()
+        return row if row is not None else None
+
+    def fetchall(self):
+        return self._cursor.fetchall()
+        
+    def executemany(self, query, params_seq):
+        query = query.replace("?", "%s")
+        self._cursor = self.pg_conn.cursor()
+        self._cursor.executemany(query, params_seq)
+        return self
+
+    def executescript(self, script):
+        self._cursor = self.pg_conn.cursor()
+        self._cursor.execute(script)
+        return self
+
+    def commit(self):
+        self.pg_conn.commit()
+        
+    def rollback(self):
+        self.pg_conn.rollback()
+
+    def close(self):
+        if self._cursor:
+            self._cursor.close()
+        self.pg_conn.close()
+        
+    def __enter__(self):
+        return self
+        
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is None:
+            self.commit()
+        else:
+            self.rollback()
+        self.close()
 
 
 def hash_password(password: str, salt: bytes | None = None) -> str:
